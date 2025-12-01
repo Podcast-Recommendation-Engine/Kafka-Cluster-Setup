@@ -1,0 +1,5 @@
+# host_vars/kafka1.yml
+broker_id: 1
+zk_id: 1
+node_name: kafka1
+node_ip: "{{ kafka_nodes['kafka1'] }}"

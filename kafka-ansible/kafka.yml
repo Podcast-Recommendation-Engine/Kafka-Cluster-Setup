@@ -1,0 +1,191 @@
+---
+- name: Deploy simple Kafka + Zookeeper cluster (3 nodes)
+  hosts: kafka
+  become: yes
+  vars:
+    kafka_archive: "kafka_{{ kafka_scala_version }}-{{ kafka_version }}.tgz"
+    kafka_download_url: "https://archive.apache.org/dist/kafka/{{ kafka_version }}/kafka_{{ kafka_scala_version }}-{{ kafka_version }}.tgz"
+    kafka_install_dir: /opt/kafka
+    kafka_tmp: /tmp/kafka.tgz
+
+
+  tasks:
+
+  - name: Update apt cache and install dependencies
+    apt:
+      name:
+        - openjdk-8-jdk
+        - wget
+        - netcat-openbsd
+      state: present
+      update_cache: yes
+
+  - name: Ensure directories exist
+    file:
+      path: "{{ item }}"
+      state: directory
+      owner: "{{ ansible_user }}"
+      group: "{{ ansible_user }}"
+      mode: "0755"
+    loop:
+      - /var/lib/kafka
+      - /var/lib/kafka/logs
+      - /var/lib/zookeeper
+      - /opt
+      - /opt/kafka
+      - /opt/kafka/logs
+
+  - name: Download Kafka archive (if not present)
+    get_url:
+      url: "{{ kafka_download_url }}"
+      dest: "{{ kafka_tmp }}"
+      mode: '0644'
+    register: dl
+    until: dl is succeeded
+    retries: 3
+    delay: 5
+
+  - name: Extract Kafka archive
+    unarchive:
+      src: "{{ kafka_tmp }}"
+      dest: /opt
+      remote_src: yes
+      creates: "/opt/{{ kafka_archive | regex_replace('.tgz','') }}"
+
+
+  - name: Remove /opt/kafka if exists
+    file:
+      path: /opt/kafka
+      state: absent
+
+  - name: Ensure /opt/kafka points to extracted folder
+    file:
+      src: "/opt/{{ kafka_archive | regex_replace('.tgz','') }}"
+      dest: /opt/kafka
+      state: link
+      force: yes  
+    when: ansible_facts['os_family'] != 'RedHat'  
+
+
+  - name: Remove old meta.properties if exists (important after cloning)
+    file:
+      path: /var/lib/kafka/logs/meta.properties
+      state: absent
+
+  - name: Ensure Kafka config directory exists
+    file:
+      path: /opt/kafka/config
+      state: directory
+      owner: "{{ ansible_user }}"
+      group: "{{ ansible_user }}"
+      mode: '0755'
+
+  # -----------------------
+  # Zookeeper configuration 
+  # -----------------------
+  - name: Configure zookeeper.properties
+    copy:
+      dest: /opt/kafka/config/zookeeper.properties
+      content: |
+        tickTime=2000
+        initLimit=10
+        syncLimit=5
+
+        dataDir=/var/lib/zookeeper
+        dataLogDir=/opt/kafka/logs
+        clientPort=2181
+
+        {% for line in zk_servers %}
+        {{ line }}
+        {% endfor %}
+    notify: reload-systemd
+
+  - name: Create myid for Zookeeper
+    copy:
+      dest: /var/lib/zookeeper/myid
+      content: "{{ zk_id }}\n"
+      owner: "{{ ansible_user }}"
+      group: "{{ ansible_user }}"
+      mode: "0644"
+
+  # -----------------------
+  # Kafka server.properties
+  # -----------------------
+  - name: Configure server.properties
+    copy:
+      dest: /opt/kafka/config/server.properties
+      content: |
+        broker.id={{ broker_id }}
+        listeners=PLAINTEXT://{{ node_ip }}:9092
+        advertised.listeners=PLAINTEXT://{{ node_ip }}:9092
+        log.dirs=/var/lib/kafka/logs
+        zookeeper.connect={{ zk_connect }}
+    notify: reload-systemd
+
+  - name: Ensure ownership of kafka directory
+    file:
+      path: /opt/kafka
+      state: directory
+      recurse: yes
+      owner: "{{ ansible_user }}"
+      group: "{{ ansible_user }}"
+
+  # -----------------------
+  # Systemd unit files and start services
+  # -----------------------
+  - name: Install zookeeper systemd service
+    copy:
+      dest: /etc/systemd/system/zookeeper.service
+      content: |
+        [Unit]
+        Description=Apache Zookeeper
+        After=network.target
+
+        [Service]
+        Type=simple
+        User={{ ansible_user }}
+        ExecStart=/opt/kafka/bin/zookeeper-server-start.sh /opt/kafka/config/zookeeper.properties
+        ExecStop=/opt/kafka/bin/zookeeper-server-stop.sh
+        Restart=on-failure
+
+        [Install]
+        WantedBy=multi-user.target
+    notify: reload-systemd
+
+  - name: Install kafka systemd service
+    copy:
+      dest: /etc/systemd/system/kafka.service
+      content: |
+        [Unit]
+        Description=Apache Kafka Broker
+        After=zookeeper.service
+
+        [Service]
+        Type=simple
+        User={{ ansible_user }}
+        ExecStart=/opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/server.properties
+        ExecStop=/opt/kafka/bin/kafka-server-stop.sh
+        Restart=on-failure
+
+        [Install]
+        WantedBy=multi-user.target
+    notify: reload-systemd
+
+  - name: Start and enable zookeeper service
+    systemd:
+      name: zookeeper
+      enabled: yes
+      state: restarted
+      daemon_reload: yes
+
+  - name: Start and enable kafka service
+    systemd:
+      name: kafka
+      enabled: yes
+      state: restarted
+      daemon_reload: no
+
+  handlers:
+    - name: reload-systemd
+      command: systemctl daemon-reload
+      become: yes
